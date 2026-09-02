@@ -11,9 +11,10 @@ mirrors) and `../rancher-mcp-proxy/CLAUDE.md`.
 
 ```
 src/
-├── main.rs      Env-var config, crypto provider, transport selection (stdio vs streamable HTTP)
-├── rancher.rs   Rancher v3 REST client — only `GET /v3/clusters`, for name → id resolution
-├── cluster.rs   Builds a kube::Client per downstream cluster via Rancher's cluster proxy
+├── main.rs        Env-var config, crypto provider, transport selection (stdio vs HTTP)
+├── credentials.rs ClientFactory: builds BOTH clients from one Rancher URL + token
+├── rancher.rs     Rancher v3 REST client — only `GET /v3/clusters`, for name → id resolution
+├── cluster.rs     Builds a kube::Client per downstream cluster via Rancher's cluster proxy
 ├── longhorn.rs  The CRD layer: LonghornApi trait + LonghornClient (kube dynamic API)
 ├── model.rs     Narrow serde views of Volume/Engine/Replica/Snapshot/Backup/BackupVolume
 ├── render.rs    Pure formatting, size decoding, replica health predicates
@@ -34,11 +35,6 @@ above. In this shell `git` is a `scmpuff` function that needs `$SCMPUFF_GIT_CMD`
 ```bash
 /usr/bin/git -C ../rancher-helm-mcp fetch origin && /usr/bin/git -C ../rancher-helm-mcp log --oneline HEAD..origin/main
 ```
-
-Not yet ported from upstream: **per-request Rancher credentials** (PR #7) reads `R_url` and
-`R_token` request headers instead of only the `RANCHER_URL`/`RANCHER_TOKEN` env vars, so one
-deployment can serve callers with different Rancher identities. Worth doing if this server is
-ever shared between users.
 
 ## rustls needs an explicit crypto provider
 
@@ -68,6 +64,37 @@ Non-tool helper methods must live in their own un-annotated `impl` block or `#[t
 will try to register them.
 
 To read the SDK source: `find ~/.cargo/registry/src -maxdepth 1 -iname "rmcp-*"`.
+
+## Per-request credentials
+
+`RANCHER_URL`/`RANCHER_TOKEN` are **optional**. `call_tool` is overridden to look for `R_url`
+and `R_token` headers in `cx.extensions.get::<http::request::Parts>()`; when present it mints a
+scoped clone of the server and dispatches through
+`Self::tool_router().call(ToolCallContext::new(&scoped, request, cx))`. With no headers and no
+static credentials it returns `invalid_request`.
+
+Things that will bite:
+
+- `credentials::ClientFactory` exists because the Rancher URL and token are needed in **two**
+  places here — `RancherClient` for `/v3`, and `ClusterClients` for the cluster proxy. An
+  override must rebuild both. `rancher-helm-mcp` only rebuilds its REST client, so do not copy
+  its single-client shape.
+- The `rancher_client` / `longhorn_client` fields are `Option`, reached through the
+  `rancher()` / `longhorn()` accessors which `expect`. That is sound *only* because
+  `call_tool` rejects the uncredentialed case before dispatching. Any new entry point that
+  reaches a tool body without going through `call_tool` breaks that invariant.
+- `#[tool_handler]` stays on the `impl ServerHandler` block even though `call_tool` is written
+  by hand — the macro only fills in what is missing. `list_tools` is still generated, which is
+  why `tools/list` works without credentials.
+- Only the HTTP transport has headers. A stdio server must have the env vars.
+- Header lookup is case-insensitive (`HeaderMap::get` normalises), so `r_url` works too.
+  Blank header values are ignored rather than used to build a broken client.
+- Testing this needs the real `StreamableHttpService`, because nothing else injects
+  `http::request::Parts` into `cx.extensions`. The tests in `server.rs` spin up the service on
+  an ephemeral port and fire raw JSON-RPC at it, pointing `R_url` at a wiremock Rancher that
+  only answers for one specific bearer token — which is what proves the header's credentials
+  were the ones used. Note the transport may answer as SSE, so responses are parsed by
+  stripping a `data:` prefix.
 
 ## Human-in-the-loop: the `*Plan` tool convention
 

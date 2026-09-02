@@ -1,17 +1,16 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod cluster;
+mod credentials;
 mod longhorn;
 mod model;
 mod rancher;
 mod render;
 mod server;
 
-use cluster::ClusterClients;
-use longhorn::LonghornClient;
-use rancher::RancherClient;
+use credentials::ClientFactory;
 use server::StorageMcpServer;
 
 #[tokio::main]
@@ -27,10 +26,11 @@ async fn main() -> Result<()> {
 
     cluster::install_crypto_provider();
 
-    let rancher_url =
-        std::env::var("RANCHER_URL").context("RANCHER_URL environment variable is required")?;
-    let rancher_token =
-        std::env::var("RANCHER_TOKEN").context("RANCHER_TOKEN environment variable is required")?;
+    // Optional: when both are absent, every tool call must instead carry
+    // `R_url` and `R_token` headers, so one deployment can serve callers with
+    // different Rancher identities. See `StorageMcpServer::call_tool`.
+    let rancher_url = std::env::var("RANCHER_URL").ok();
+    let rancher_token = std::env::var("RANCHER_TOKEN").ok();
     let tls_verify = std::env::var("RANCHER_TLS_VERIFY")
         .map(|v| v != "false" && v != "0")
         .unwrap_or(true);
@@ -39,11 +39,19 @@ async fn main() -> Result<()> {
     let longhorn_namespace =
         std::env::var("LONGHORN_NAMESPACE").unwrap_or_else(|_| "longhorn-system".to_string());
 
-    info!(%rancher_url, tls_verify, %longhorn_namespace, "Starting rancher-storage-mcp");
+    info!(tls_verify, %longhorn_namespace, "Starting rancher-storage-mcp");
 
-    let rancher = RancherClient::new(rancher_url.clone(), rancher_token.clone(), tls_verify)?;
-    let clusters = ClusterClients::new(rancher_url, rancher_token, tls_verify, longhorn_namespace);
-    let server = StorageMcpServer::new(rancher, LonghornClient::new(clusters));
+    let factory = ClientFactory::new(tls_verify, longhorn_namespace);
+    let server = match (rancher_url, rancher_token) {
+        (Some(url), Some(token)) => {
+            info!(%url, "Using static Rancher credentials from the environment");
+            StorageMcpServer::configured(factory.build(url, token)?, factory)
+        }
+        _ => {
+            info!("No static Rancher credentials; R_url and R_token headers required per request");
+            StorageMcpServer::unconfigured(factory)
+        }
+    };
 
     match std::env::var("PORT")
         .ok()

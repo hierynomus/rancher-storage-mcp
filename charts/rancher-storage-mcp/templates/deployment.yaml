@@ -41,6 +41,7 @@ spec:
               value: "3000"
             - name: RANCHER_TLS_VERIFY
               value: {{ .Values.rancher.tlsVerify | quote }}
+            {{- if include "rancher-storage-mcp.staticCredentials" . }}
             - name: RANCHER_URL
               valueFrom:
                 secretKeyRef:
@@ -51,6 +52,7 @@ spec:
                 secretKeyRef:
                   name: {{ include "rancher-storage-mcp.rancherSecretName" . }}
                   key: RANCHER_TOKEN
+            {{- end }}
             - name: LONGHORN_NAMESPACE
               value: {{ .Values.longhorn.namespace | quote }}
             {{- with .Values.env }}

@@ -12,10 +12,17 @@ nameOverride: ""
 fullnameOverride: ""
 
 # Rancher Manager connection.
+#
+# Leave url, token and existingSecret ALL empty to run in per-request mode: no
+# static credentials are baked in, and every tool call must carry R_url and
+# R_token headers instead, so one deployment serves callers with different
+# Rancher identities under their own RBAC. The Rancher AI assistant sends these
+# headers itself.
 rancher:
-  # URL of the Rancher Manager instance (required).
+  # URL of the Rancher Manager instance. Required unless running in per-request mode.
   url: ""
-  # API token with access to the target clusters (required unless existingSecret is set).
+  # API token with access to the target clusters. Required when url is set and
+  # existingSecret is not.
   token: ""
   # Name of a pre-existing Secret with keys RANCHER_URL and RANCHER_TOKEN.
   # When set, rancher.url and rancher.token are ignored.

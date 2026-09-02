@@ -60,6 +60,17 @@ Name of the Secret that holds Rancher credentials.
 {{- end }}
 
 {{/*
+Whether static Rancher credentials are configured at all. When they are not, the
+server requires R_url/R_token headers on every tool call instead, so one
+deployment can serve callers with different Rancher identities.
+*/}}
+{{- define "rancher-storage-mcp.staticCredentials" -}}
+{{- if or .Values.rancher.existingSecret (and .Values.rancher.url .Values.rancher.token) -}}
+true
+{{- end -}}
+{{- end }}
+
+{{/*
 TLS secret name for Ingress.
 */}}
 {{- define "rancher-storage-mcp.tlsSecretName" -}}

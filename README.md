@@ -150,12 +150,38 @@ All configuration is by environment variable. There are no CLI flags.
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `RANCHER_URL` | yes | — | Rancher Manager base URL, e.g. `https://rancher.example.com`. |
-| `RANCHER_TOKEN` | yes | — | Rancher API token. Used as the bearer token for both `/v3` and the cluster proxy. |
+| `RANCHER_URL` | no* | — | Rancher Manager base URL, e.g. `https://rancher.example.com`. |
+| `RANCHER_TOKEN` | no* | — | Rancher API token. Used as the bearer token for both `/v3` and the cluster proxy. |
 | `RANCHER_TLS_VERIFY` | no | `true` | `false` or `0` skips TLS verification (self-signed lab certs). |
 | `LONGHORN_NAMESPACE` | no | `longhorn-system` | Namespace Longhorn is installed into on the downstream clusters. |
 | `PORT` | no | — | When set, serve streamable HTTP on this port. When unset, serve stdio. |
 | `RUST_LOG` | no | `info` | `tracing` `EnvFilter` directive. Logs always go to stderr. |
+
+\* Together they are optional: set **both** for a single static identity, or **neither** to run
+in per-request mode. Setting only one is a configuration error.
+
+### Per-request credentials
+
+Over the HTTP transport, a caller may send `R_url` and `R_token` headers on a `tools/call`
+request. When present they replace the configured credentials for that one call, so the work
+runs under the **caller's** own Rancher RBAC rather than the deployment's. The Rancher AI
+assistant sends these headers itself, which lets one deployment serve many users without
+sharing a token.
+
+- Start with **neither** `RANCHER_URL` nor `RANCHER_TOKEN` to *require* the headers: a
+  `tools/call` without them is rejected with `R_url and R_token headers are required…`.
+  In the chart, leave `rancher.url`, `rancher.token` and `rancher.existingSecret` all empty.
+- Start with both set to have a fallback identity that the headers override when supplied.
+- `tools/list` and `initialize` never need credentials, so an agent can always discover the
+  tool set first.
+- Headers do not exist on the stdio transport, so a stdio server must have the env vars set.
+- `RANCHER_TLS_VERIFY` and `LONGHORN_NAMESPACE` stay deployment-wide; only the URL and token
+  are per-request.
+
+Because this server uses the Rancher URL and token in two places — the `/v3` REST client that
+resolves cluster names *and* the cluster proxy every Longhorn request goes through — a
+per-request override rebuilds both clients. That is the one structural difference from
+`rancher-helm-mcp`, which only needs to rebuild its REST client.
 
 ### Generating a Rancher API token
 
@@ -171,8 +197,9 @@ own permissions are what this server gets — it does not escalate.
 which is why this chart contains no `Role`, no `RoleBinding`, and sets
 `automountServiceAccountToken: false`.
 
-Authorization is entirely the Rancher token's user's RBAC **on each downstream cluster**. Bind
-this `Role` there — a namespaced `Role` is enough, because every Longhorn CRD is namespaced:
+Authorization is entirely the RBAC of whichever Rancher identity made the call — the `R_token`
+header's user in per-request mode, otherwise `RANCHER_TOKEN`'s — **on each downstream
+cluster**. Bind this `Role` there — a namespaced `Role` is enough, because every Longhorn CRD is namespaced:
 
 ```yaml
 apiVersion: rbac.authorization.k8s.io/v1
@@ -222,8 +249,15 @@ helm install rancher-storage-mcp oci://ghcr.io/hierynomus/rancher-storage-mcp/ch
   --set rancher.token=token-abcde:xxxxxxxxxxxx
 ```
 
-For production, keep the token out of Helm values by creating the Secret yourself with keys
-`RANCHER_URL` and `RANCHER_TOKEN`, then:
+Or deploy with **no** static credentials at all, requiring `R_url`/`R_token` per call:
+
+```bash
+helm install rancher-storage-mcp oci://ghcr.io/hierynomus/rancher-storage-mcp/charts/rancher-storage-mcp \
+  --namespace rancher-storage --create-namespace
+```
+
+For a single static identity that keeps the token out of Helm values, create the Secret
+yourself with keys `RANCHER_URL` and `RANCHER_TOKEN`, then:
 
 ```bash
 helm install rancher-storage-mcp oci://ghcr.io/hierynomus/rancher-storage-mcp/charts/rancher-storage-mcp \

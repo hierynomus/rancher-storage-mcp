@@ -11,13 +11,19 @@ use std::time::Duration;
 use anyhow::Result;
 use chrono::Utc;
 use rmcp::{
-    handler::server::wrapper::Parameters,
-    model::{Implementation, InitializeResult, ServerCapabilities, ServerInfo},
-    schemars, tool, tool_handler, tool_router, ServerHandler,
+    handler::server::{tool::ToolCallContext, wrapper::Parameters},
+    model::{
+        CallToolRequestParams, CallToolResult, Implementation, InitializeResult,
+        ServerCapabilities, ServerInfo,
+    },
+    schemars,
+    service::{RequestContext, RoleServer},
+    tool, tool_handler, tool_router, ServerHandler,
 };
 use serde::Deserialize;
-use tracing::info;
+use tracing::{info, warn};
 
+use crate::credentials::{ClientFactory, Clients};
 use crate::longhorn::LonghornApi;
 use crate::model::{Replica, Volume};
 use crate::rancher::RancherApi;
@@ -35,22 +41,78 @@ const MAX_REPLICAS: i64 = 20;
 const POLL_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Header names the Rancher AI assistant sends to scope a call to the calling
+/// user's own Rancher identity. HTTP header lookup is case-insensitive.
+const HEADER_RANCHER_URL: &str = "R_url";
+const HEADER_RANCHER_TOKEN: &str = "R_token";
+
 #[derive(Clone)]
 pub struct StorageMcpServer {
-    rancher: Arc<dyn RancherApi>,
-    longhorn: Arc<dyn LonghornApi>,
+    /// `None` when the server was started without `RANCHER_URL`/`RANCHER_TOKEN`;
+    /// `call_tool` then requires per-request credential headers.
+    rancher_client: Option<Arc<dyn RancherApi>>,
+    longhorn_client: Option<Arc<dyn LonghornApi>>,
+    /// Mints a client pair for per-request credentials. `None` in tests, which
+    /// inject stubs directly.
+    factory: Option<ClientFactory>,
     poll_timeout: Duration,
     poll_interval: Duration,
 }
 
 impl StorageMcpServer {
-    pub fn new(rancher: impl RancherApi + 'static, longhorn: impl LonghornApi + 'static) -> Self {
+    /// Injects concrete implementations directly. Test-only: production goes
+    /// through `configured` / `unconfigured` so a request can override the
+    /// credentials.
+    #[cfg(test)]
+    fn new(rancher: impl RancherApi + 'static, longhorn: impl LonghornApi + 'static) -> Self {
         Self {
-            rancher: Arc::new(rancher),
-            longhorn: Arc::new(longhorn),
+            rancher_client: Some(Arc::new(rancher)),
+            longhorn_client: Some(Arc::new(longhorn)),
+            factory: None,
             poll_timeout: POLL_TIMEOUT,
             poll_interval: POLL_INTERVAL,
         }
+    }
+
+    /// Static credentials from the environment, with a factory so a request may
+    /// still override them.
+    pub fn configured(clients: Clients, factory: ClientFactory) -> Self {
+        Self {
+            rancher_client: Some(clients.rancher),
+            longhorn_client: Some(clients.longhorn),
+            factory: Some(factory),
+            poll_timeout: POLL_TIMEOUT,
+            poll_interval: POLL_INTERVAL,
+        }
+    }
+
+    /// No static credentials: every tool call must carry `R_url`/`R_token`.
+    pub fn unconfigured(factory: ClientFactory) -> Self {
+        Self {
+            rancher_client: None,
+            longhorn_client: None,
+            factory: Some(factory),
+            poll_timeout: POLL_TIMEOUT,
+            poll_interval: POLL_INTERVAL,
+        }
+    }
+
+    /// # Panics
+    /// Only if reached with no credentials configured, which `call_tool`
+    /// rejects before dispatching to any tool.
+    fn rancher(&self) -> &dyn RancherApi {
+        self.rancher_client
+            .as_deref()
+            .expect("no Rancher credentials; call_tool should have rejected this request")
+    }
+
+    /// # Panics
+    /// Only if reached with no credentials configured, which `call_tool`
+    /// rejects before dispatching to any tool.
+    fn longhorn(&self) -> &dyn LonghornApi {
+        self.longhorn_client
+            .as_deref()
+            .expect("no Rancher credentials; call_tool should have rejected this request")
     }
 
     /// Shortens the polling loops so tests can exercise the timeout branches.
@@ -143,7 +205,7 @@ impl StorageMcpServer {
         &self,
         Parameters(_): Parameters<ListClustersInput>,
     ) -> Result<String, rmcp::ErrorData> {
-        let clusters = self.rancher.list_clusters().await.map_err(internal)?;
+        let clusters = self.rancher().list_clusters().await.map_err(internal)?;
 
         if clusters.is_empty() {
             return Ok("No clusters found.".to_string());
@@ -179,12 +241,12 @@ impl StorageMcpServer {
     ) -> Result<String, rmcp::ErrorData> {
         let cluster_id = self.resolve_cluster_id(&input.cluster).await?;
         let volumes = self
-            .longhorn
+            .longhorn()
             .list_volumes(&cluster_id)
             .await
             .map_err(internal)?;
         let all_replicas = self
-            .longhorn
+            .longhorn()
             .list_all_replicas(&cluster_id)
             .await
             .map_err(internal)?;
@@ -199,14 +261,14 @@ impl StorageMcpServer {
             return Ok(format!(
                 "No Longhorn volumes matched in namespace '{}' of cluster {cluster_id} \
                  ({total} volume(s) present before filtering).",
-                self.longhorn.namespace(),
+                self.longhorn().namespace(),
             ));
         }
 
         let mut out = format!(
             "{} of {total} Longhorn volume(s) in namespace '{}' of cluster {cluster_id}:\n",
             matched.len(),
-            self.longhorn.namespace(),
+            self.longhorn().namespace(),
         );
         for v in matched {
             let replicas = replicas_of(&all_replicas, &v.name);
@@ -230,17 +292,17 @@ impl StorageMcpServer {
         let name = self.resolve_volume_name(&cluster_id, &input.volume).await?;
 
         let volume = self
-            .longhorn
+            .longhorn()
             .get_volume(&cluster_id, &name)
             .await
             .map_err(internal)?;
         let engines = self
-            .longhorn
+            .longhorn()
             .list_engines(&cluster_id, &name)
             .await
             .map_err(internal)?;
         let replicas = self
-            .longhorn
+            .longhorn()
             .list_replicas(&cluster_id, &name)
             .await
             .map_err(internal)?;
@@ -249,7 +311,7 @@ impl StorageMcpServer {
         // kinds, or a cluster with no backup target, must not blank out the
         // volume and replica detail the caller actually asked for.
         let mut notes = Vec::new();
-        let snapshots = match self.longhorn.list_snapshots(&cluster_id, &name).await {
+        let snapshots = match self.longhorn().list_snapshots(&cluster_id, &name).await {
             Ok(s) => s,
             Err(e) => {
                 notes.push(format!("could not list snapshots: {}", chain(&e)));
@@ -257,14 +319,18 @@ impl StorageMcpServer {
             }
         };
         let target = volume.spec.backup_target_name.as_deref();
-        let backups = match self.longhorn.list_backups(&cluster_id, &name, target).await {
+        let backups = match self
+            .longhorn()
+            .list_backups(&cluster_id, &name, target)
+            .await
+        {
             Ok(b) => b,
             Err(e) => {
                 notes.push(format!("could not list backups: {}", chain(&e)));
                 Vec::new()
             }
         };
-        let backup_volume = match self.longhorn.get_backup_volume(&cluster_id, &name).await {
+        let backup_volume = match self.longhorn().get_backup_volume(&cluster_id, &name).await {
             Ok(bv) => bv,
             Err(e) => {
                 notes.push(format!("could not read BackupVolume: {}", chain(&e)));
@@ -303,7 +369,7 @@ impl StorageMcpServer {
         let cluster_id = self.resolve_cluster_id(&input.cluster).await?;
         let name = self.resolve_volume_name(&cluster_id, &input.volume).await?;
         let volume = self
-            .longhorn
+            .longhorn()
             .get_volume(&cluster_id, &name)
             .await
             .map_err(internal)?;
@@ -314,7 +380,7 @@ impl StorageMcpServer {
         let current = volume.spec.number_of_replicas.unwrap_or(0);
         if current == desired {
             let replicas = self
-                .longhorn
+                .longhorn()
                 .list_replicas(&cluster_id, &name)
                 .await
                 .map_err(internal)?;
@@ -325,7 +391,7 @@ impl StorageMcpServer {
         }
 
         info!(cluster_id, volume = %name, current, desired, "Patching replica count");
-        self.longhorn
+        self.longhorn()
             .patch_replica_count(&cluster_id, &name, desired)
             .await
             .map_err(internal)?;
@@ -338,7 +404,7 @@ impl StorageMcpServer {
         let mut converged = false;
         loop {
             replicas = self
-                .longhorn
+                .longhorn()
                 .list_replicas(&cluster_id, &name)
                 .await
                 .map_err(internal)?;
@@ -399,7 +465,7 @@ impl StorageMcpServer {
         let cluster_id = self.resolve_cluster_id(&input.cluster).await?;
         let name = self.resolve_volume_name(&cluster_id, &input.volume).await?;
         let volume = self
-            .longhorn
+            .longhorn()
             .get_volume(&cluster_id, &name)
             .await
             .map_err(internal)?;
@@ -417,7 +483,7 @@ impl StorageMcpServer {
             "resource": {
                 "kind": "Volume",
                 "name": name,
-                "namespace": self.longhorn.namespace(),
+                "namespace": self.longhorn().namespace(),
                 "cluster": cluster_id,
             },
             "payload": {
@@ -442,7 +508,7 @@ impl StorageMcpServer {
         let cluster_id = self.resolve_cluster_id(&input.cluster).await?;
         let name = self.resolve_volume_name(&cluster_id, &input.volume).await?;
         let volume = self
-            .longhorn
+            .longhorn()
             .get_volume(&cluster_id, &name)
             .await
             .map_err(internal)?;
@@ -455,7 +521,7 @@ impl StorageMcpServer {
         info!(cluster_id, volume = %name, snapshot = %snapshot_name, "Creating Snapshot CR");
         let mut reused = false;
         if let Err(create_err) = self
-            .longhorn
+            .longhorn()
             .create_snapshot(&cluster_id, &snapshot_name, &name, input.labels.clone())
             .await
         {
@@ -464,7 +530,7 @@ impl StorageMcpServer {
             // is a successful retry, not a failure. Only report the create
             // error if there is genuinely no such snapshot.
             match self
-                .longhorn
+                .longhorn()
                 .get_snapshot(&cluster_id, &snapshot_name)
                 .await
             {
@@ -477,7 +543,7 @@ impl StorageMcpServer {
         let mut snapshot = None;
         loop {
             match self
-                .longhorn
+                .longhorn()
                 .get_snapshot(&cluster_id, &snapshot_name)
                 .await
             {
@@ -559,7 +625,7 @@ impl StorageMcpServer {
         let name = self.resolve_volume_name(&cluster_id, &input.volume).await?;
         // Resolving the volume also proves it exists before the human is asked.
         let volume = self
-            .longhorn
+            .longhorn()
             .get_volume(&cluster_id, &name)
             .await
             .map_err(internal)?;
@@ -585,7 +651,7 @@ impl StorageMcpServer {
             "resource": {
                 "kind": "Snapshot",
                 "name": snapshot_name,
-                "namespace": self.longhorn.namespace(),
+                "namespace": self.longhorn().namespace(),
                 "cluster": cluster_id,
             },
             "payload": payload,
@@ -604,7 +670,7 @@ impl StorageMcpServer {
             return Ok(cluster.to_string());
         }
 
-        let clusters = self.rancher.list_clusters().await.map_err(internal)?;
+        let clusters = self.rancher().list_clusters().await.map_err(internal)?;
 
         clusters
             .into_iter()
@@ -629,7 +695,7 @@ impl StorageMcpServer {
         reference: &str,
     ) -> Result<String, rmcp::ErrorData> {
         let volumes = self
-            .longhorn
+            .longhorn()
             .list_volumes(cluster_id)
             .await
             .map_err(internal)?;
@@ -657,7 +723,7 @@ impl StorageMcpServer {
                 format!(
                     "no Longhorn volume '{reference}' in namespace '{}' of cluster {cluster_id}; \
                      use list_volumes to see what is available",
-                    self.longhorn.namespace()
+                    self.longhorn().namespace()
                 ),
                 None,
             )),
@@ -824,6 +890,39 @@ fn check_replica_count_preconditions(
 
 // ── ServerHandler ─────────────────────────────────────────────────────────────
 
+impl StorageMcpServer {
+    /// If the caller supplied `R_url` and `R_token` headers (as the Rancher AI
+    /// assistant does), mint a client pair for those credentials so the call
+    /// runs under the caller's own Rancher RBAC rather than the deployment's.
+    ///
+    /// Returns `None` for the stdio transport, which has no request headers.
+    fn scoped_to_request_headers(&self, cx: &RequestContext<RoleServer>) -> Option<Self> {
+        let factory = self.factory.as_ref()?;
+        let parts = cx.extensions.get::<http::request::Parts>()?;
+        let url = parts.headers.get(HEADER_RANCHER_URL)?.to_str().ok()?;
+        let token = parts.headers.get(HEADER_RANCHER_TOKEN)?.to_str().ok()?;
+        if url.is_empty() || token.is_empty() {
+            return None;
+        }
+
+        // Both clients have to be rebuilt: the Rancher URL and token are used
+        // for `/v3` cluster lookups *and* for the cluster proxy every Longhorn
+        // request goes through.
+        let clients = factory
+            .build(url.to_string(), token.to_string())
+            .map_err(|e| warn!("ignoring per-request Rancher credentials: {e:#}"))
+            .ok()?;
+
+        Some(Self {
+            rancher_client: Some(clients.rancher),
+            longhorn_client: Some(clients.longhorn),
+            factory: Some(factory.clone()),
+            poll_timeout: self.poll_timeout,
+            poll_interval: self.poll_interval,
+        })
+    }
+}
+
 #[tool_handler]
 impl ServerHandler for StorageMcpServer {
     fn get_info(&self) -> ServerInfo {
@@ -832,6 +931,29 @@ impl ServerHandler for StorageMcpServer {
                 env!("CARGO_PKG_NAME"),
                 env!("CARGO_PKG_VERSION"),
             ))
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        cx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        if let Some(scoped) = self.scoped_to_request_headers(&cx) {
+            return Self::tool_router()
+                .call(ToolCallContext::new(&scoped, request, cx))
+                .await;
+        }
+        if self.rancher_client.is_none() {
+            return Err(rmcp::ErrorData::invalid_request(
+                format!(
+                    "{HEADER_RANCHER_URL} and {HEADER_RANCHER_TOKEN} headers are required when                      RANCHER_URL and RANCHER_TOKEN are not configured"
+                ),
+                None,
+            ));
+        }
+        Self::tool_router()
+            .call(ToolCallContext::new(self, request, cx))
+            .await
     }
 }
 
@@ -2140,5 +2262,260 @@ mod tests {
             calls.patches
         );
         assert!(calls.creates.is_empty(), "a Plan tool created a snapshot");
+    }
+
+    // ── Per-request credentials over HTTP ─────────────────────────────────
+    //
+    // `scoped_to_request_headers` reads `http::request::Parts` out of
+    // `cx.extensions`, which only StreamableHttpService injects — so these
+    // spin up the real service and fire raw JSON-RPC at it over HTTP.
+
+    use crate::credentials::{ClientFactory, Clients};
+    use axum::Router;
+    use rmcp::transport::streamable_http_server::{
+        session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
+    };
+    use wiremock::matchers::{bearer_token, method as http_method, path as http_path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn factory() -> ClientFactory {
+        crate::cluster::install_crypto_provider();
+        ClientFactory::new(true, "longhorn-system".to_string())
+    }
+
+    async fn serve(server: StorageMcpServer) -> String {
+        let svc = StreamableHttpService::new(
+            move || Ok(server.clone()),
+            LocalSessionManager::default().into(),
+            StreamableHttpServerConfig::default().disable_allowed_hosts(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, Router::new().fallback_service(svc))
+                .await
+                .unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    async fn initialize(client: &reqwest::Client, url: &str) -> String {
+        let resp = client
+            .post(url)
+            .header("Accept", "application/json, text/event-stream")
+            .json(&serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": { "name": "test", "version": "0" }
+                }
+            }))
+            .send()
+            .await
+            .unwrap();
+        let sid = resp
+            .headers()
+            .get("Mcp-Session-Id")
+            .and_then(|v| v.to_str().ok())
+            .expect("initialize must return a session id")
+            .to_string();
+        client
+            .post(url)
+            .header("Accept", "application/json, text/event-stream")
+            .header("Mcp-Session-Id", &sid)
+            .json(&serde_json::json!({
+                "jsonrpc": "2.0", "method": "notifications/initialized", "params": {}
+            }))
+            .send()
+            .await
+            .unwrap();
+        sid
+    }
+
+    /// Fires one JSON-RPC request, optionally with credential headers, and
+    /// returns the decoded response (the transport may answer as SSE).
+    async fn rpc(
+        url: &str,
+        sid: &str,
+        client: &reqwest::Client,
+        body: serde_json::Value,
+        creds: Option<(&str, &str)>,
+    ) -> serde_json::Value {
+        let mut req = client
+            .post(url)
+            .header("Accept", "application/json, text/event-stream")
+            .header("Mcp-Session-Id", sid);
+        if let Some((r_url, r_token)) = creds {
+            req = req.header("R_url", r_url).header("R_token", r_token);
+        }
+        let text = req.json(&body).send().await.unwrap().text().await.unwrap();
+        for line in text.lines() {
+            let payload = line.strip_prefix("data:").unwrap_or(line).trim();
+            if payload.starts_with('{') {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) {
+                    if v.get("result").is_some() || v.get("error").is_some() {
+                        return v;
+                    }
+                }
+            }
+        }
+        panic!("no JSON-RPC result in response: {text}");
+    }
+
+    async fn call_list_clusters(
+        url: &str,
+        sid: &str,
+        client: &reqwest::Client,
+        creds: Option<(&str, &str)>,
+    ) -> serde_json::Value {
+        rpc(
+            url,
+            sid,
+            client,
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": { "name": "list_clusters", "arguments": {} }
+            }),
+            creds,
+        )
+        .await
+    }
+
+    /// A stand-in Rancher that only answers `GET /v3/clusters`, and only for
+    /// the given token — so a test can prove which credentials were used.
+    async fn fake_rancher(token: &str, cluster_name: &str) -> MockServer {
+        let mock = MockServer::start().await;
+        Mock::given(http_method("GET"))
+            .and(http_path("/v3/clusters"))
+            .and(bearer_token(token))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{ "id": "c-m-hdr001", "name": cluster_name, "state": "active" }]
+            })))
+            .mount(&mock)
+            .await;
+        mock
+    }
+
+    #[tokio::test]
+    async fn credential_headers_scope_the_call_to_the_callers_rancher() {
+        let rancher = fake_rancher("caller-token", "caller-cluster").await;
+        let url = serve(StorageMcpServer::unconfigured(factory())).await;
+        let client = reqwest::Client::new();
+        let sid = initialize(&client, &url).await;
+
+        let resp =
+            call_list_clusters(&url, &sid, &client, Some((&rancher.uri(), "caller-token"))).await;
+
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(text.contains("caller-cluster"), "response: {resp}");
+        // The mock only answers for `caller-token`, so a hit proves the
+        // header's token reached Rancher.
+        assert_eq!(rancher.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_unconfigured_server_refuses_a_call_without_credential_headers() {
+        let url = serve(StorageMcpServer::unconfigured(factory())).await;
+        let client = reqwest::Client::new();
+        let sid = initialize(&client, &url).await;
+
+        let resp = call_list_clusters(&url, &sid, &client, None).await;
+
+        let msg = resp["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            msg.contains("R_url") && msg.contains("R_token"),
+            "response: {resp}"
+        );
+    }
+
+    #[tokio::test]
+    async fn credential_headers_override_static_credentials() {
+        let rancher = fake_rancher("caller-token", "caller-cluster").await;
+        let static_clients = Clients {
+            rancher: Arc::new(StubRancher::new()),
+            longhorn: Arc::new(StubLonghorn::default()),
+        };
+        let url = serve(StorageMcpServer::configured(static_clients, factory())).await;
+        let client = reqwest::Client::new();
+        let sid = initialize(&client, &url).await;
+
+        let resp =
+            call_list_clusters(&url, &sid, &client, Some((&rancher.uri(), "caller-token"))).await;
+
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(text.contains("caller-cluster"), "response: {resp}");
+        assert!(
+            !text.contains("prod"),
+            "the static credentials must not be used when headers are present: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_configured_server_still_works_without_credential_headers() {
+        let static_clients = Clients {
+            rancher: Arc::new(StubRancher::new()),
+            longhorn: Arc::new(StubLonghorn::default()),
+        };
+        let url = serve(StorageMcpServer::configured(static_clients, factory())).await;
+        let client = reqwest::Client::new();
+        let sid = initialize(&client, &url).await;
+
+        let resp = call_list_clusters(&url, &sid, &client, None).await;
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(text.contains("name=prod"), "response: {resp}");
+    }
+
+    #[tokio::test]
+    async fn blank_credential_headers_fall_back_instead_of_building_a_broken_client() {
+        let static_clients = Clients {
+            rancher: Arc::new(StubRancher::new()),
+            longhorn: Arc::new(StubLonghorn::default()),
+        };
+        let url = serve(StorageMcpServer::configured(static_clients, factory())).await;
+        let client = reqwest::Client::new();
+        let sid = initialize(&client, &url).await;
+
+        let resp = call_list_clusters(&url, &sid, &client, Some(("", ""))).await;
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(text.contains("name=prod"), "response: {resp}");
+    }
+
+    #[tokio::test]
+    async fn tools_can_be_listed_without_any_credentials() {
+        // Only `call_tool` is gated: an agent must be able to discover the
+        // tool set before it has credentials to use them with.
+        let url = serve(StorageMcpServer::unconfigured(factory())).await;
+        let client = reqwest::Client::new();
+        let sid = initialize(&client, &url).await;
+
+        let resp = rpc(
+            &url,
+            &sid,
+            &client,
+            serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}}),
+            None,
+        )
+        .await;
+
+        let names: Vec<&str> = resp["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names.len(), 7, "tools: {names:?}");
+        assert!(
+            names.contains(&"set_volume_replica_countPlan"),
+            "tools: {names:?}"
+        );
     }
 }
