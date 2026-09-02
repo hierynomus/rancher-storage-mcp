@@ -387,6 +387,49 @@ impl StorageMcpServer {
     }
 
     #[tool(
+        name = "set_volume_replica_countPlan",
+        description = "Describe what set_volume_replica_count will do without executing it. \
+        Call this before set_volume_replica_count to show the user a summary of the planned \
+        replica count change for confirmation."
+    )]
+    async fn set_volume_replica_count_plan(
+        &self,
+        Parameters(input): Parameters<SetReplicaCountInput>,
+    ) -> Result<String, rmcp::ErrorData> {
+        let cluster_id = self.resolve_cluster_id(&input.cluster).await?;
+        let name = self.resolve_volume_name(&cluster_id, &input.volume).await?;
+        let volume = self
+            .longhorn
+            .get_volume(&cluster_id, &name)
+            .await
+            .map_err(internal)?;
+
+        // Check the preconditions here too, so an impossible change is refused
+        // before a human is asked to approve it rather than after.
+        check_replica_count_preconditions(
+            &volume,
+            input.replica_count,
+            input.allow_detached.unwrap_or(false),
+        )?;
+
+        let plan = serde_json::json!([{
+            "type": "update",
+            "resource": {
+                "kind": "Volume",
+                "name": name,
+                "namespace": self.longhorn.namespace(),
+                "cluster": cluster_id,
+            },
+            "payload": {
+                "original": { "numberOfReplicas": volume.spec.number_of_replicas.unwrap_or(0) },
+                "patched": { "numberOfReplicas": input.replica_count },
+            },
+        }]);
+        serde_json::to_string(&plan)
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))
+    }
+
+    #[tool(
         description = "Take a snapshot of a Longhorn volume by creating a Snapshot CR. This is the \
         primitive both the CSI 'type: snap' path and the Longhorn UI use. Idempotent per snapshot \
         name: re-running with the same name never takes a second snapshot. Returns whether the \
@@ -500,6 +543,55 @@ impl StorageMcpServer {
             }
         }
         Ok(out)
+    }
+
+    #[tool(
+        name = "create_volume_snapshotPlan",
+        description = "Describe what create_volume_snapshot will do without executing it. \
+        Call this before create_volume_snapshot to show the user a summary of the planned \
+        snapshot for confirmation."
+    )]
+    async fn create_volume_snapshot_plan(
+        &self,
+        Parameters(input): Parameters<CreateSnapshotInput>,
+    ) -> Result<String, rmcp::ErrorData> {
+        let cluster_id = self.resolve_cluster_id(&input.cluster).await?;
+        let name = self.resolve_volume_name(&cluster_id, &input.volume).await?;
+        // Resolving the volume also proves it exists before the human is asked.
+        let volume = self
+            .longhorn
+            .get_volume(&cluster_id, &name)
+            .await
+            .map_err(internal)?;
+
+        // An omitted name is generated at execution time, so the plan shows the
+        // pattern rather than a concrete name it would then not match.
+        let snapshot_name = match input.snapshot_name.as_deref().filter(|s| !s.is_empty()) {
+            Some(s) => s.to_string(),
+            None => format!("{name}-mcp-<utc-timestamp>"),
+        };
+
+        let mut payload = serde_json::json!({
+            "volume": name,
+            "createSnapshot": true,
+            "volumeState": render::dash(volume.status.state.as_deref()),
+        });
+        if let Some(labels) = input.labels.as_ref().filter(|l| !l.is_empty()) {
+            payload["labels"] = serde_json::json!(labels);
+        }
+
+        let plan = serde_json::json!([{
+            "type": "create",
+            "resource": {
+                "kind": "Snapshot",
+                "name": snapshot_name,
+                "namespace": self.longhorn.namespace(),
+                "cluster": cluster_id,
+            },
+            "payload": payload,
+        }]);
+        serde_json::to_string(&plan)
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))
     }
 }
 
@@ -1073,6 +1165,56 @@ mod tests {
                 .to_string(),
         );
         s
+    }
+
+    /// Lets a test hold the stub while the server owns it, so the recorded
+    /// calls can be read back afterwards.
+    struct SharedStub(Arc<StubLonghorn>);
+
+    #[async_trait::async_trait]
+    impl LonghornApi for SharedStub {
+        fn namespace(&self) -> &str {
+            self.0.namespace()
+        }
+        async fn list_volumes(&self, c: &str) -> Result<Vec<Volume>> {
+            self.0.list_volumes(c).await
+        }
+        async fn get_volume(&self, c: &str, n: &str) -> Result<Volume> {
+            self.0.get_volume(c, n).await
+        }
+        async fn list_all_replicas(&self, c: &str) -> Result<Vec<Replica>> {
+            self.0.list_all_replicas(c).await
+        }
+        async fn list_engines(&self, c: &str, v: &str) -> Result<Vec<Engine>> {
+            self.0.list_engines(c, v).await
+        }
+        async fn list_replicas(&self, c: &str, v: &str) -> Result<Vec<Replica>> {
+            self.0.list_replicas(c, v).await
+        }
+        async fn list_snapshots(&self, c: &str, v: &str) -> Result<Vec<Snapshot>> {
+            self.0.list_snapshots(c, v).await
+        }
+        async fn list_backups(&self, c: &str, v: &str, t: Option<&str>) -> Result<Vec<Backup>> {
+            self.0.list_backups(c, v, t).await
+        }
+        async fn get_backup_volume(&self, c: &str, v: &str) -> Result<Option<BackupVolume>> {
+            self.0.get_backup_volume(c, v).await
+        }
+        async fn patch_replica_count(&self, c: &str, n: &str, k: i64) -> Result<Volume> {
+            self.0.patch_replica_count(c, n, k).await
+        }
+        async fn create_snapshot(
+            &self,
+            c: &str,
+            s: &str,
+            v: &str,
+            l: Option<BTreeMap<String, String>>,
+        ) -> Result<Snapshot> {
+            self.0.create_snapshot(c, s, v, l).await
+        }
+        async fn get_snapshot(&self, c: &str, n: &str) -> Result<Snapshot> {
+            self.0.get_snapshot(c, n).await
+        }
     }
 
     fn server(longhorn: StubLonghorn) -> StorageMcpServer {
@@ -1795,62 +1937,11 @@ mod tests {
     /// wire-level intent rather than the rendered text.
     #[tokio::test]
     async fn recorded_calls_carry_exactly_the_intended_mutation() {
-        // Sharing the stub with the server requires reading the recording back
-        // out through a channel of our own: build the stub, keep a handle to
-        // its `Arc`-free interior by constructing the server from a wrapper.
-        struct Shared(Arc<StubLonghorn>);
-
-        #[async_trait::async_trait]
-        impl LonghornApi for Shared {
-            fn namespace(&self) -> &str {
-                self.0.namespace()
-            }
-            async fn list_volumes(&self, c: &str) -> Result<Vec<Volume>> {
-                self.0.list_volumes(c).await
-            }
-            async fn get_volume(&self, c: &str, n: &str) -> Result<Volume> {
-                self.0.get_volume(c, n).await
-            }
-            async fn list_all_replicas(&self, c: &str) -> Result<Vec<Replica>> {
-                self.0.list_all_replicas(c).await
-            }
-            async fn list_engines(&self, c: &str, v: &str) -> Result<Vec<Engine>> {
-                self.0.list_engines(c, v).await
-            }
-            async fn list_replicas(&self, c: &str, v: &str) -> Result<Vec<Replica>> {
-                self.0.list_replicas(c, v).await
-            }
-            async fn list_snapshots(&self, c: &str, v: &str) -> Result<Vec<Snapshot>> {
-                self.0.list_snapshots(c, v).await
-            }
-            async fn list_backups(&self, c: &str, v: &str, t: Option<&str>) -> Result<Vec<Backup>> {
-                self.0.list_backups(c, v, t).await
-            }
-            async fn get_backup_volume(&self, c: &str, v: &str) -> Result<Option<BackupVolume>> {
-                self.0.get_backup_volume(c, v).await
-            }
-            async fn patch_replica_count(&self, c: &str, n: &str, k: i64) -> Result<Volume> {
-                self.0.patch_replica_count(c, n, k).await
-            }
-            async fn create_snapshot(
-                &self,
-                c: &str,
-                s: &str,
-                v: &str,
-                l: Option<BTreeMap<String, String>>,
-            ) -> Result<Snapshot> {
-                self.0.create_snapshot(c, s, v, l).await
-            }
-            async fn get_snapshot(&self, c: &str, n: &str) -> Result<Snapshot> {
-                self.0.get_snapshot(c, n).await
-            }
-        }
-
         let stub = Arc::new(StubLonghorn {
             snapshot_states: Mutex::new(VecDeque::from(vec![ready_snapshot("snap-1", VOL)])),
             ..Default::default()
         });
-        let s = StorageMcpServer::new(StubRancher::new(), Shared(Arc::clone(&stub)))
+        let s = StorageMcpServer::new(StubRancher::new(), SharedStub(Arc::clone(&stub)))
             .with_poll(Duration::from_millis(120), Duration::from_millis(20));
 
         s.set_volume_replica_count(Parameters(replica_input(2)))
@@ -1873,5 +1964,181 @@ mod tests {
             calls.creates,
             vec![("snap-1".to_string(), VOL.to_string(), Some(labels))],
         );
+    }
+
+    // ── Plan tools ────────────────────────────────────────────────────────
+
+    /// Every tool in the AIAgentConfig's `humanValidationTools` needs a
+    /// `<name>Plan` companion: the Rancher AI front-end calls it first and
+    /// renders the result as the confirmation prompt the human approves.
+    #[tokio::test]
+    async fn the_replica_count_plan_describes_the_change_without_making_it() {
+        let stub = StubLonghorn::default();
+        let s = server(stub);
+
+        let out = s
+            .set_volume_replica_count_plan(Parameters(SetReplicaCountInput {
+                cluster: CLUSTER.to_string(),
+                volume: VOL.to_string(),
+                replica_count: 2,
+                allow_detached: None,
+            }))
+            .await
+            .unwrap();
+
+        let plan: serde_json::Value = serde_json::from_str(&out).expect("Plan tools return JSON");
+        assert_eq!(plan[0]["type"], "update");
+        assert_eq!(plan[0]["resource"]["kind"], "Volume");
+        assert_eq!(plan[0]["resource"]["name"], VOL);
+        assert_eq!(plan[0]["resource"]["namespace"], "longhorn-system");
+        assert_eq!(plan[0]["resource"]["cluster"], CLUSTER);
+        // The real current value, so the prompt can render "3 → 2".
+        assert_eq!(plan[0]["payload"]["original"]["numberOfReplicas"], 3);
+        assert_eq!(plan[0]["payload"]["patched"]["numberOfReplicas"], 2);
+    }
+
+    #[tokio::test]
+    async fn the_replica_count_plan_resolves_a_pvc_reference_to_the_longhorn_volume() {
+        let out = server(StubLonghorn::default())
+            .set_volume_replica_count_plan(Parameters(SetReplicaCountInput {
+                cluster: CLUSTER.to_string(),
+                volume: "postgres/data-postgres-0".to_string(),
+                replica_count: 2,
+                allow_detached: None,
+            }))
+            .await
+            .unwrap();
+        let plan: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(plan[0]["resource"]["name"], VOL);
+    }
+
+    #[tokio::test]
+    async fn the_replica_count_plan_refuses_before_asking_the_human() {
+        // A plan for a change that would then be rejected is worse than no
+        // plan: it asks for approval of something impossible.
+        let err = server(StubLonghorn::default())
+            .set_volume_replica_count_plan(Parameters(SetReplicaCountInput {
+                cluster: CLUSTER.to_string(),
+                volume: VOL.to_string(),
+                replica_count: 25,
+                allow_detached: None,
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:?}").contains("between 1 and 20"),
+            "error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_snapshot_plan_describes_the_snapshot_cr_it_would_create() {
+        let out = server(StubLonghorn::default())
+            .create_volume_snapshot_plan(Parameters(CreateSnapshotInput {
+                cluster: CLUSTER.to_string(),
+                volume: VOL.to_string(),
+                snapshot_name: Some("pre-upgrade".to_string()),
+                labels: None,
+            }))
+            .await
+            .unwrap();
+
+        let plan: serde_json::Value = serde_json::from_str(&out).expect("Plan tools return JSON");
+        assert_eq!(plan[0]["type"], "create");
+        assert_eq!(plan[0]["resource"]["kind"], "Snapshot");
+        assert_eq!(plan[0]["resource"]["name"], "pre-upgrade");
+        assert_eq!(plan[0]["payload"]["volume"], VOL);
+        assert_eq!(plan[0]["payload"]["createSnapshot"], true);
+        assert_eq!(plan[0]["payload"]["volumeState"], "attached");
+        assert!(
+            plan[0]["payload"].get("labels").is_none(),
+            "no labels requested: {}",
+            plan[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_snapshot_plan_shows_a_name_pattern_when_the_name_is_generated() {
+        let out = server(StubLonghorn::default())
+            .create_volume_snapshot_plan(Parameters(CreateSnapshotInput {
+                cluster: CLUSTER.to_string(),
+                volume: VOL.to_string(),
+                snapshot_name: None,
+                labels: None,
+            }))
+            .await
+            .unwrap();
+        let plan: serde_json::Value = serde_json::from_str(&out).unwrap();
+        // A concrete timestamp here would not match the one used at execution.
+        assert_eq!(
+            plan[0]["resource"]["name"],
+            format!("{VOL}-mcp-<utc-timestamp>")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_snapshot_plan_forwards_requested_labels() {
+        let mut labels = BTreeMap::new();
+        labels.insert("purpose".to_string(), "pre-upgrade".to_string());
+        let out = server(StubLonghorn::default())
+            .create_volume_snapshot_plan(Parameters(CreateSnapshotInput {
+                cluster: CLUSTER.to_string(),
+                volume: VOL.to_string(),
+                snapshot_name: Some("snap-1".to_string()),
+                labels: Some(labels),
+            }))
+            .await
+            .unwrap();
+        let plan: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(plan[0]["payload"]["labels"]["purpose"], "pre-upgrade");
+    }
+
+    #[tokio::test]
+    async fn the_snapshot_plan_refuses_an_unknown_volume() {
+        let err = server(StubLonghorn::default())
+            .create_volume_snapshot_plan(Parameters(CreateSnapshotInput {
+                cluster: CLUSTER.to_string(),
+                volume: "nope".to_string(),
+                snapshot_name: None,
+                labels: None,
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:?}").contains("list_volumes"),
+            "error: {err:?}"
+        );
+    }
+
+    /// Neither Plan tool may mutate anything — that is the whole point.
+    #[tokio::test]
+    async fn plan_tools_record_no_writes() {
+        let stub = Arc::new(StubLonghorn::default());
+        let s = StorageMcpServer::new(StubRancher::new(), SharedStub(Arc::clone(&stub)));
+
+        s.set_volume_replica_count_plan(Parameters(SetReplicaCountInput {
+            cluster: CLUSTER.to_string(),
+            volume: VOL.to_string(),
+            replica_count: 2,
+            allow_detached: None,
+        }))
+        .await
+        .unwrap();
+        s.create_volume_snapshot_plan(Parameters(CreateSnapshotInput {
+            cluster: CLUSTER.to_string(),
+            volume: VOL.to_string(),
+            snapshot_name: Some("snap-1".to_string()),
+            labels: None,
+        }))
+        .await
+        .unwrap();
+
+        let calls = stub.calls.lock().unwrap();
+        assert!(
+            calls.patches.is_empty(),
+            "a Plan tool patched: {:?}",
+            calls.patches
+        );
+        assert!(calls.creates.is_empty(), "a Plan tool created a snapshot");
     }
 }

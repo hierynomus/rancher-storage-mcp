@@ -60,11 +60,45 @@ exactly the token's own RBAC on the downstream cluster — see [RBAC](#rbac).
 | `list_volumes` | List Longhorn volumes with state, robustness, size, healthy/desired replica counts and the PVC they back. Filters by `namespace`, `state`, `robustness`, `name_contains`. |
 | `inspect_volume` | Full detail for one volume: spec and status, conditions that are not True, every replica with node/disk/mode/health, in-flight rebuild or restore progress, snapshots and backups. |
 | `set_volume_replica_count` | Patch `spec.numberOfReplicas`, after checking Longhorn's own preconditions. |
+| `set_volume_replica_countPlan` | Describe that change without making it, for human confirmation. |
 | `create_volume_snapshot` | Take a snapshot by creating a `Snapshot` CR. Idempotent per snapshot name. |
+| `create_volume_snapshotPlan` | Describe that snapshot without taking it, for human confirmation. |
 
 The three volume tools accept a Longhorn volume name (`pvc-<uuid>`), a `namespace/pvc-name`
 reference, or a bare PVC name when it is unambiguous — an ambiguous name returns the
 candidates rather than picking one.
+
+### Human-in-the-loop
+
+Both mutating tools are listed in `ai-agent-config.yaml` under
+`spec.humanValidationTools`, and each has a `<tool_name>Plan` companion. The Rancher AI
+front-end calls the Plan tool first and renders its output as the confirmation prompt the
+human approves or rejects, then calls the real tool only on approval — so a mutating tool
+without its Plan companion would leave the human nothing to approve.
+
+Plan tools take the **same arguments** as the tool they describe and return structured JSON:
+
+```json
+[{
+  "type": "update",
+  "resource": { "kind": "Volume", "name": "pvc-840804d8-…",
+                "namespace": "longhorn-system", "cluster": "c-m-abcd1234" },
+  "payload": { "original": { "numberOfReplicas": 3 },
+               "patched":  { "numberOfReplicas": 2 } }
+}]
+```
+
+They read from the cluster but never write. Two consequences worth knowing:
+
+- The `original` values are the volume's **real** current values, so the prompt renders an
+  actual delta rather than a placeholder.
+- The Plan tool runs the same preconditions as the real tool, so an impossible change is
+  refused *before* a human is asked to approve it. Asking for approval of something that will
+  then be rejected is worse than refusing up front.
+
+When `snapshot_name` is omitted, the plan shows the pattern
+`<volume>-mcp-<utc-timestamp>` rather than a concrete name, because the timestamp is generated
+at execution time and a concrete name in the plan would not match it.
 
 ### Mutating tools submit an intent, then poll
 

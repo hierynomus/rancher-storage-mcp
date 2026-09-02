@@ -23,6 +23,23 @@ src/
 `RancherApi` and `LonghornApi` are traits so `server.rs` can be tested against stubs. That is
 the whole reason they exist — keep tool logic above the trait, not below it.
 
+## Upstream drift
+
+`rancher-helm-mcp` is the reference for shared idioms, and it moves. **Fetch and read
+`origin/main`, not a local checkout** — the local clone was eight commits behind while this
+project was first written, and the missing commits contained the whole `*Plan` tool convention
+above. In this shell `git` is a `scmpuff` function that needs `$SCMPUFF_GIT_CMD`, so call
+`/usr/bin/git` directly:
+
+```bash
+/usr/bin/git -C ../rancher-helm-mcp fetch origin && /usr/bin/git -C ../rancher-helm-mcp log --oneline HEAD..origin/main
+```
+
+Not yet ported from upstream: **per-request Rancher credentials** (PR #7) reads `R_url` and
+`R_token` request headers instead of only the `RANCHER_URL`/`RANCHER_TOKEN` env vars, so one
+deployment can serve callers with different Rancher identities. Worth doing if this server is
+ever shared between users.
+
 ## rustls needs an explicit crypto provider
 
 `reqwest` and `kube-client` each pull `rustls` 0.23 with a *different* provider feature, so
@@ -30,7 +47,8 @@ both `ring` and `aws-lc-rs` end up enabled and rustls refuses to pick one. Build
 client then **panics** inside rustls rather than returning an error. `cluster::install_crypto_provider()`
 resolves it once, and is called from `main` and from every test that builds a client. If you
 ever see `Could not automatically determine the process-level CryptoProvider`, a code path is
-constructing a client without having called it.
+constructing a client without having called it. Upstream hit the same thing — see
+`hierynomus/rancher-helm-mcp` branch `fix/rustls-crypto-provider`.
 
 ## rmcp API (v1.7)
 
@@ -50,6 +68,37 @@ Non-tool helper methods must live in their own un-annotated `impl` block or `#[t
 will try to register them.
 
 To read the SDK source: `find ~/.cargo/registry/src -maxdepth 1 -iname "rmcp-*"`.
+
+## Human-in-the-loop: the `*Plan` tool convention
+
+Every tool listed in `ai-agent-config.yaml`'s `spec.humanValidationTools` **must** have a
+companion tool named `<tool_name>Plan`. The Rancher AI front-end calls the Plan tool first and
+renders its output as the confirmation prompt, then calls the real tool only on approval. A
+mutating tool without its Plan companion silently skips the human-in-the-loop step — there is
+nothing for the human to approve. This is half of the safety mechanism, not an optional extra.
+
+The convention comes from `../rancher-helm-mcp/src/server.rs`:
+
+- Declare the name explicitly with `#[tool(name = "set_volume_replica_countPlan")]` — the Rust
+  method name is snake_case, the tool name is not.
+- Take the **same input struct** as the tool it describes, so the agent can pass identical
+  arguments through after approval.
+- Return a JSON **string** via `serde_json::to_string` of an array of
+  `{"type": "create"|"update", "resource": {"kind","name","namespace","cluster"}, "payload": {…}}`.
+  For an update, `payload` carries `original` and `patched`. **Returning prose instead of this
+  JSON stops the confirmation prompt from rendering** — that was the bug fixed upstream in
+  `hierynomus/rancher-helm-mcp` PR #6.
+- List only the real tools in `humanValidationTools`, never the Plan tools.
+
+Two deliberate divergences from the Helm server, whose Plan tools are pure functions:
+
+- Ours read from the cluster, so `original` holds the volume's real current values and the
+  prompt shows a true delta instead of a placeholder like the Helm server's
+  `{"revision": "current"}`.
+- Ours run the same preconditions as the real tool and error out, so an impossible change is
+  refused before a human is asked to approve it.
+
+They must never write. `plan_tools_record_no_writes` in `server.rs` asserts that.
 
 ## kube crate (v0.99)
 

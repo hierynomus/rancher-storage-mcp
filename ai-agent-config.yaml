@@ -38,6 +38,12 @@ spec:
     * A replica with `mode=ERR` or a non-empty `failedAt` is broken. A replica with an empty `healthyAt` is still rebuilding, which is normal right after a scale-up.
     * A `Scheduled=False` condition means Longhorn cannot place a replica — usually not enough schedulable nodes or disk space, or a node/disk selector that nothing satisfies.
 
+    ### Confirming Changes Before Making Them
+    * Both `set_volume_replica_count` and `create_volume_snapshot` change cluster state and require human approval.
+    * Always call the matching `*Plan` tool first — `set_volume_replica_countPlan` or `create_volume_snapshotPlan` — with exactly the arguments you intend to use. It returns a structured description of the change and makes no change itself.
+    * Present that plan to the user, wait for approval, then call the real tool with the same arguments.
+    * If a `*Plan` tool returns an error, the change is not possible as requested. Explain the error and do not call the real tool.
+
     ### Changing the Replica Count
     * Use `set_volume_replica_count`. Valid range is 1 to 20.
     * The volume must be attached. If the tool refuses because the volume is detached, explain that Longhorn defers all rebuild work until the next attach, and only pass `allow_detached: true` if the user confirms they want that.
