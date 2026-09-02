@@ -1,0 +1,13 @@
+apiVersion: v2
+name: rancher-storage-mcp
+description: MCP server that inspects and manages Longhorn volumes on Rancher-managed clusters
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - mcp
+  - longhorn
+  - storage
+  - rancher
+maintainers:
+  - name: SUSE

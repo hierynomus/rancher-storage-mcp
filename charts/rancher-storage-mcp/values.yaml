@@ -1,0 +1,74 @@
+replicaCount: 1
+
+image:
+  repository: ghcr.io/hierynomus/rancher-storage-mcp
+  tag: main
+  pullPolicy: Always
+
+# imagePullSecrets:
+#   - name: ghcr-pull-secret
+
+nameOverride: ""
+fullnameOverride: ""
+
+# Rancher Manager connection.
+rancher:
+  # URL of the Rancher Manager instance (required).
+  url: ""
+  # API token with access to the target clusters (required unless existingSecret is set).
+  token: ""
+  # Name of a pre-existing Secret with keys RANCHER_URL and RANCHER_TOKEN.
+  # When set, rancher.url and rancher.token are ignored.
+  existingSecret: ""
+  # Set to "false" to skip TLS verification (useful for self-signed certs in dev/lab).
+  tlsVerify: "true"
+
+# Namespace Longhorn is installed into on the downstream clusters.
+longhorn:
+  namespace: longhorn-system
+
+service:
+  type: ClusterIP
+  port: 3000
+  # nodePort: 30300  # pin a specific NodePort (only used when type=NodePort)
+
+ingress:
+  enabled: false
+  className: traefik
+  host: rancher-storage-mcp.example.com
+  tls:
+    enabled: false
+    secretName: ""
+    certManager:
+      enabled: false
+      clusterIssuer: letsencrypt-prod
+
+resources:
+  limits:
+    cpu: 100m
+    memory: 64Mi
+  requests:
+    cpu: 20m
+    memory: 32Mi
+
+# Extra environment variables passed verbatim to the container.
+env:
+  - name: RUST_LOG
+    value: info
+
+podAnnotations: {}
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1001
+  runAsGroup: 1001
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

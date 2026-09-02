@@ -1,0 +1,29 @@
+[package]
+name = "rancher-storage-mcp"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "rancher-storage-mcp"
+path = "src/main.rs"
+
+[dependencies]
+rmcp = { version = "1.7", features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal"] }
+tokio-util = "0.7"
+axum = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+anyhow = "1"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+kube = { version = "0.99", features = ["client"] }
+http = "1"
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+k8s-openapi = { version = "0.24", features = ["v1_30"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+async-trait = "0.1"
+
+[dev-dependencies]
+wiremock = "0.6"
